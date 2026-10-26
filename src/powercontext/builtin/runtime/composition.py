@@ -99,6 +99,7 @@ from powercontext.builtin.persistence.processing_migration import (
 from powercontext.builtin.persistence.scope_search_schema import ensure_scope_search_schema
 from powercontext.builtin.persistence.seekdb.profile import SeekDBConfig, SeekDBProfile
 from powercontext.builtin.persistence.skill_distribution_schema import ensure_skill_distribution_schema
+from powercontext.builtin.persistence.source_lifecycle import SourceLifecycleRepository
 from powercontext.builtin.persistence.sqlite.experience_index import SQLiteExperienceFTSIndex
 from powercontext.builtin.persistence.sqlite.memory_index import SQLiteMemoryFTSIndex, SQLiteMemoryVectorIndex
 from powercontext.builtin.persistence.sqlite.profile import SQLiteConfig, SQLiteProfile
@@ -156,6 +157,7 @@ from powercontext.builtin.runtime.readiness import (
 )
 from powercontext.builtin.runtime.recall_sufficiency import RecallSufficiencyPolicy
 from powercontext.builtin.runtime.relational import RelationalContexts
+from powercontext.builtin.runtime.source_lifecycle import SourceLifecycleApplication
 from powercontext.builtin.runtime.topic_memory_processing import (
     TopicMemoryWorkerSpec,
     run_topic_memory_worker,
@@ -653,6 +655,9 @@ async def open_builtin_runtime(
                 remote_ingestion=contexts,
             )
         )
+        # The graph owns no rows before its first registration, so it is wired after
+        # construction: only this composition knows the opened persistence profile.
+        runtime.lifecycle = SourceLifecycleApplication(runtime, SourceLifecycleRepository(contexts.database))
         runtime.artifact_processing_supervisor = await resources.enter_async_context(
             _open_artifact_processing_supervisor(config, contexts, processing_bindings, tracing=tracing)
         )

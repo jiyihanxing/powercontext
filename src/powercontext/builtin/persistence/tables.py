@@ -51,6 +51,7 @@ from powercontext.limits import (
     MAX_SCOPE_SUMMARY_LENGTH,
     MAX_SCOPE_TITLE_LENGTH,
     MAX_SOURCE_ID_LENGTH,
+    MAX_SOURCE_LIFECYCLE_NODE_ID_LENGTH,
     MAX_SOURCE_TYPE_LENGTH,
 )
 
@@ -1090,6 +1091,40 @@ RECEIPT_MIGRATION_REVIEW_TABLE = Table(
     Column("reason", String(64), nullable=False),
 )
 
+# One row per registered evidence node. Registration order is the topological
+# order, so reading a Scope's graph ordered by ``ordinal`` lets availability
+# propagate from Sources to their descendants in a single pass.
+SOURCE_LIFECYCLE_NODES_TABLE = Table(
+    "pc_source_lifecycle_nodes",
+    SHARED_METADATA,
+    Column("scope_id", identity_string(MAX_SCOPE_ID_LENGTH), primary_key=True),
+    Column("node_id", identity_string(MAX_SOURCE_LIFECYCLE_NODE_ID_LENGTH), primary_key=True),
+    Column("family", String(16), nullable=False),
+    Column("policy", String(8)),
+    Column("revision", Integer, nullable=False),
+    Column("sequence", Integer, nullable=False),
+    Column("available", Boolean, nullable=False),
+    Column("ordinal", Integer, nullable=False),
+    Column("reference", _canonical_payload_type(), nullable=False),
+    Column("parents", _canonical_payload_type(), nullable=False),
+    ForeignKeyConstraint(("scope_id",), ("pc_scopes.scope_id",), ondelete="CASCADE"),
+    UniqueConstraint("scope_id", "ordinal", name="uq_pc_source_lifecycle_nodes_ordinal"),
+    CheckConstraint(
+        "family IN ('source', 'memory', 'topic')",
+        name="ck_pc_source_lifecycle_nodes_family",
+    ),
+    CheckConstraint(
+        "policy IS NULL OR policy IN ('all', 'any')",
+        name="ck_pc_source_lifecycle_nodes_policy",
+    ),
+    # Derived nodes carry no lifecycle revision of their own, so zero is valid there.
+    CheckConstraint("revision >= 0", name="ck_pc_source_lifecycle_nodes_revision_nonnegative"),
+    CheckConstraint("sequence >= 0", name="ck_pc_source_lifecycle_nodes_sequence_nonnegative"),
+    CheckConstraint("ordinal >= 0", name="ck_pc_source_lifecycle_nodes_ordinal_nonnegative"),
+)
+
+SOURCE_LIFECYCLE_TABLES = (SOURCE_LIFECYCLE_NODES_TABLE,)
+
 # The recurrence ledger is append-only: every correction is a new row, and the
 # only write path is the existing task-outcome incubation window.
 RECURRENCE_MATCH_TABLE = Table(
@@ -1187,5 +1222,6 @@ BUILTIN_TABLES = (
     + MEMORY_TABLES
     + STATISTICS_TABLES
     + RECURRENCE_TABLES
+    + SOURCE_LIFECYCLE_TABLES
     + (ARTIFACT_TAGS_TABLE, DREAM_RUNS_TABLE, RECEIPT_MIGRATION_REVIEW_TABLE)
 )

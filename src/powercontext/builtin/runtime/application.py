@@ -299,6 +299,7 @@ if TYPE_CHECKING:
 
     from powercontext.builtin.handoff_report.application import HandoffReportApplication
     from powercontext.builtin.runtime.artifact_processing import ArtifactProcessingSupervisors
+    from powercontext.builtin.runtime.source_lifecycle import SourceLifecycleApplication
 
 
 class TopicMemorySearch(Protocol):
@@ -1659,6 +1660,23 @@ def _admission_keyword(admission: AdmissionFloor | None) -> dict[str, Any]:
     return {} if admission is None else {"admission": admission}
 
 
+def _without_withdrawn_topics(
+    result: TopicMemorySearchResult,
+    *,
+    withdrawn: frozenset[str],
+    limit: int,
+) -> TopicMemorySearchResult:
+    """Drop hits whose Topic Artifact currently has no supporting evidence."""
+
+    if not withdrawn:
+        return result
+    return result.model_copy(
+        update={
+            "hits": tuple(hit for hit in result.hits if hit.artifact_ref.artifact_id not in withdrawn)[:limit],
+        }
+    )
+
+
 class ContextApplication:
     """Select the scoped context-preparation application service."""
 
@@ -2580,6 +2598,42 @@ class ScopedMemoryApplication:
                 entry=_entry_record(updated, retired),
             )
 
+    async def set_available(
+        self,
+        citation: MemoryCitation,
+        /,
+        *,
+        available: bool,
+        reason: str | None = None,
+    ) -> MemoryMutationResult:
+        """Deactivate or reactivate the cited logical entry at the current head.
+
+        Unlike :meth:`retire`, the citation may anchor an older Revision: the entry is
+        resolved by identity against the current head, so a Memory that advanced since
+        the caller captured the citation still matches. Repeating the state it already
+        holds commits no new Revision.
+        """
+
+        async with self._runtime._context(
+            self.scope_id,
+            embedding_purpose=ModelUsagePurpose.MEMORY_INDEXING,
+        ) as context:
+            async with self._runtime._locked(self.scope_id):
+                service = context.artifacts.memory
+                current, entries = await service.head_entries(context.artifacts.memory_artifact_id)
+                entry = _head_entry(entries, citation.entry_id)
+                updated = await (
+                    service.reactivate(current, entries=(entry,), reason=reason)
+                    if available
+                    else service.forget(current, entries=(entry,), reason=reason)
+                )
+            resolved = _head_entry(await service.entries(updated), entry.entry_id)
+            return MemoryMutationResult(
+                previous_revision=current.revision,
+                memory_ref=updated.as_ref(),
+                entry=_entry_record(updated, resolved),
+            )
+
     async def changes(self, *, since_revision: int | None = None) -> MemoryChangesPage:
         async with self._runtime._context(self.scope_id) as context:
             service = context.artifacts.memory
@@ -2651,6 +2705,14 @@ class ScopedTopicMemoryApplication:
         if len(set(analyze_text(query).split())) > MAX_TOPIC_MEMORY_QUERY_TERMS:
             raise InvalidRuntimeRequestError("topic-memory-query-terms")
 
+        # Hits of Topics without supporting evidence are dropped below, so ask for
+        # enough of them that the caller's limit can still be filled afterwards.
+        withdrawn = await self._runtime._withdrawn_topic_artifacts(self.scope_id)
+        fetch_limit = (
+            request.limit
+            if not withdrawn
+            else min(MAX_TOPIC_MEMORY_SEARCH_LIMIT, request.limit + len(withdrawn))
+        )
         used_fallback = False
         async with self._runtime._scoped_operation(
             self.scope_id,
@@ -2664,7 +2726,7 @@ class ScopedTopicMemoryApplication:
                 result = await search(
                     self.scope_id,
                     query,
-                    limit=request.limit,
+                    limit=fetch_limit,
                     mode="fts",
                     **_admission_keyword(admission),
                 )
@@ -2677,7 +2739,9 @@ class ScopedTopicMemoryApplication:
                     admission,
                     query_embedding,
                     embedding_timeout_seconds,
+                    limit=fetch_limit,
                 )
+            result = _without_withdrawn_topics(result, withdrawn=withdrawn, limit=request.limit)
         observer = self._runtime._topic_memory_search_observer
         if observer is not None:
             try:
@@ -2704,12 +2768,13 @@ class ScopedTopicMemoryApplication:
         admission: AdmissionFloor | None,
         query_embedding: MemoryQueryEmbedding | None,
         embedding_timeout_seconds: float | None,
+        limit: int,
     ) -> tuple[TopicMemorySearchResult, bool]:
         if query_embedding is not None and query_embedding.embedding_profile == embedding.profile:
             result = await search(
                 self.scope_id,
                 request.query,
-                limit=request.limit,
+                limit=limit,
                 mode="hybrid",
                 query_vector=query_embedding.query_vector,
                 embedding_profile=query_embedding.embedding_profile,
@@ -2743,7 +2808,7 @@ class ScopedTopicMemoryApplication:
             result = await search(
                 self.scope_id,
                 request.query,
-                limit=request.limit,
+                limit=limit,
                 mode="hybrid",
                 query_vector=embedded.vectors[0],
                 embedding_profile=embedding.profile,
@@ -2762,7 +2827,7 @@ class ScopedTopicMemoryApplication:
         result = await search(
             self.scope_id,
             request.query,
-            limit=request.limit,
+            limit=limit,
             mode="fts",
             **_admission_keyword(admission),
         )
@@ -3037,6 +3102,7 @@ class BuiltinRuntime:
         scheduled_experience_runner: ScheduledExperienceRunner | None = None,
         remote_ingestion: RemoteIngestion | None = None,
         dream_service: DreamService | None = None,
+        lifecycle: SourceLifecycleApplication | None = None,
         generation_concurrency: int = 4,
     ) -> None:
         if source_window_limit < 1:
@@ -3047,6 +3113,7 @@ class BuiltinRuntime:
             raise _RuntimeConfigurationError("scope_cache_size")
         self._provider = provider
         self._capabilities = capabilities
+        self.lifecycle = lifecycle
         self._review_service = review_service
         self.profiles = profiles
         self.subject_sources = subject_sources
@@ -3472,6 +3539,13 @@ class BuiltinRuntime:
             raise _RuntimeStateError("skill-publication")
         return self._skill_publication_service(validate_scope_id(scope_id), target.target_id, artifact.artifact_id)
 
+    async def _withdrawn_topic_artifacts(self, scope_id: str) -> frozenset[str]:
+        """Topic Artifacts that the Scope's evidence graph currently cannot support."""
+
+        if self.lifecycle is None:
+            return frozenset()
+        return await self.lifecycle.withdrawn_topics(scope_id)
+
     def _statistics(self, scope_id: str) -> RelationalScopedStatistics:
         if self._statistics_service is None:
             raise _RuntimeStateError("statistics")
@@ -3599,6 +3673,13 @@ async def _cited_entry(
     ):
         raise MemoryEntryNotFoundError(citation.entry_id)
     return await service.validate_citation(citation)
+
+
+def _head_entry(entries: Sequence[MemoryEntryVersion], entry_id: str) -> MemoryEntryVersion:
+    for entry in entries:
+        if entry.entry_id == entry_id:
+            return entry
+    raise MemoryEntryNotFoundError(entry_id)
 
 
 def _entry_record(memory: Memory, entry: MemoryEntryVersion) -> MemoryEntryRecord:
