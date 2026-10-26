@@ -166,6 +166,11 @@ from powercontext.builtin.runtime._scope_cache import (
     ScopeCacheObserver,
     ScopeEvictor,
 )
+from powercontext.builtin.runtime.context_pack import (
+    ContextPack,
+    ContextPackDelta,
+    ContextPackError,
+)
 from powercontext.builtin.runtime.decision_model import DecisionModel
 from powercontext.builtin.runtime.errors import InvalidRuntimeRequestError, TopicMemoryProcessingUnavailableError
 from powercontext.builtin.runtime.models import (
@@ -858,6 +863,34 @@ class ScopedContextApplication:
             if authorize_scopes is not None:
                 await authorize_scopes((self.scope_id, *scope.context_references))
             return await self._prepare(request, scope)
+
+    async def prepare_incremental(
+        self,
+        request: PrepareContextRequest,
+        /,
+        *,
+        base_pack: ContextPack | bytes | None = None,
+        authorize_scopes: Callable[[tuple[str, ...]], Awaitable[None]] | None = None,
+    ) -> ContextPack | ContextPackDelta:
+        """Prepare this round's context as a complete pack or as a delta against ``base_pack``.
+
+        The target text is exactly what :meth:`prepare` returns, so citations and the
+        ordinary prepare path stay untouched; only the transfer form changes. With no base
+        the caller receives the complete pack, and with a base it receives the chunks that
+        its pack cannot rebuild locally. Because the base is passed in rather than
+        remembered, two clients on different bases are served by the same Runtime with no
+        per-client state, and the returned value survives serialization: a receiver rebuilds
+        from ``to_bytes()`` alone.
+        """
+
+        prepared = await self.prepare(request, authorize_scopes=authorize_scopes)
+        target = ContextPack.from_content(prepared.content or "")
+        if base_pack is None:
+            return target
+        base = ContextPack.from_bytes(base_pack) if isinstance(base_pack, (bytes, bytearray, memoryview)) else base_pack
+        if not isinstance(base, ContextPack):
+            raise ContextPackError("base-pack-not-a-context-pack")
+        return ContextPackDelta.between(base, target)
 
     async def _prepare(self, request: PrepareContextRequest, scope: ScopeDescriptor, /) -> PreparedContext:
         build, effort = await self._prepare_build(request, scope)
