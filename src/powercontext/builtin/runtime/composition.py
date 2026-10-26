@@ -97,6 +97,7 @@ from powercontext.builtin.persistence.processing_migration import (
     bootstrap_processing_schema,
 )
 from powercontext.builtin.persistence.scope_search_schema import ensure_scope_search_schema
+from powercontext.builtin.persistence.seekdb.memory_index import SeekDBMemoryIndex
 from powercontext.builtin.persistence.seekdb.profile import SeekDBConfig, SeekDBProfile
 from powercontext.builtin.persistence.skill_distribution_schema import ensure_skill_distribution_schema
 from powercontext.builtin.persistence.source_lifecycle import SourceLifecycleRepository
@@ -975,10 +976,15 @@ async def open_builtin_contexts(
                 await contexts.aclose_usage_recorder()
         return
     experience_index = OceanBaseExperienceFTSIndex()
-    indexes = [OceanBaseMemoryFTSIndex()]
-    if embedding_model is not None:
-        indexes.append(OceanBaseMemoryVectorIndex(embedding_model.profile))
-    index = CompositeMemoryIndex(*indexes)
+    memory_fts = OceanBaseMemoryFTSIndex()
+    memory_vector = None if embedding_model is None else OceanBaseMemoryVectorIndex(embedding_model.profile)
+    # seekdb answers a hybrid candidate request in one statement; the server-backed profile
+    # keeps its per-channel candidate queries.
+    index: MemoryIndex = (
+        SeekDBMemoryIndex(memory_fts, memory_vector)
+        if isinstance(database, SeekDBConfig)
+        else CompositeMemoryIndex(memory_fts, *(() if memory_vector is None else (memory_vector,)))
+    )
     topic_indexes: list[TopicMemoryIndex] = [OceanBaseTopicMemoryFTSIndex()]
     if embedding_model is not None:
         topic_indexes.append(OceanBaseTopicMemoryVectorIndex(embedding_model.profile))
