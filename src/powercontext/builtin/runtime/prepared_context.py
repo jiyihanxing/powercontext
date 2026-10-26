@@ -28,6 +28,7 @@ from powercontext.builtin.artifacts.memory.models import MemoryCitation, MemoryH
 from powercontext.builtin.artifacts.profile.models import Profile
 from powercontext.builtin.artifacts.topic_memory import TopicMemory, TopicMemorySearchHit
 from powercontext.builtin.runtime.errors import PreparedContextInvariantError
+from powercontext.builtin.runtime.evidence_ranking import EvidenceSentence, rank_evidence
 from powercontext.builtin.runtime.models import PrepareContextRequest, PreparedContext
 from powercontext.builtin.runtime.prepared_code import (
     CodeEvidenceRef,
@@ -47,6 +48,14 @@ _ELLIPSIS = "…"
 _BEGIN_MARKER = "BEGIN_POWERCONTEXT_PREPARED_CONTEXT_V1"
 _END_MARKER = "END_POWERCONTEXT_PREPARED_CONTEXT_V1"
 _Item = TypeVar("_Item")
+# An excerpt of one entry costs one citation, so a second slice of the same entry costs another
+# citation instead of one more copy of the text. Neighbouring slices are therefore joined while
+# the gap between them is cheaper than the citation block that joining removes.
+_EVIDENCE_MERGE_GAP = 24
+# A cut shorter than this is not worth the citation it has to pay for: leave the bytes unused
+# instead of delivering a stub nobody can read.
+_EVIDENCE_MIN_PARTIAL_CHARS = 32
+_EVIDENCE_FRAGMENT_LIMIT = 16
 
 
 @dataclass(frozen=True)
@@ -96,6 +105,10 @@ class PreparedContextOmissions:
 class PreparedContextBuild:
     """Final public context and the exact origins selected to produce it.
 
+    ``fragments`` is filled by evidence selection and stays empty otherwise, and only then does
+    ``origins`` describe excerpts rather than whole entries: one origin per fragment, in the same
+    order, so a caller can pair the two by position and re-read every slice in the original entry.
+
     ``omissions`` is always filled by the Builder. The RFC 1560 recall trace is deliberately
     **not** a field here: ``ScopedContextApplication._prepare`` returns ``build.context`` and
     discards the rest, so such a field would have no production observer. The trace is
@@ -106,6 +119,7 @@ class PreparedContextBuild:
     origins: tuple[PreparedContextOrigin, ...]
     omissions: PreparedContextOmissions = PreparedContextOmissions()
     code_origins: tuple[CodeEvidenceRef, ...] = ()
+    fragments: tuple[PreparedFragment, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -115,6 +129,22 @@ class MemoryEntryAddress:
     memory: ArtifactAddress
     entry_id: str
     entry_version_id: str
+
+
+@dataclass(frozen=True)
+class PreparedFragment:
+    """One literal excerpt of one Memory entry version.
+
+    ``start`` and ``end`` are half-open Python character offsets into the entry text and
+    ``text`` is exactly ``entry.text[start:end]``, so a fragment never rewrites, translates or
+    summarises its source. That is what makes the citation an assertion a caller can re-check
+    against the original text instead of a label it has to trust.
+    """
+
+    address: MemoryEntryAddress
+    start: int
+    end: int
+    text: str
 
 
 PreparedContextOrigin = MemoryCitation | ArtifactRef | MemoryEntryAddress | ArtifactAddress
@@ -235,6 +265,23 @@ class PreparedContextBuilder:
         if sum(len(candidates.hits) for candidates in experience_candidates) > self.experience_candidate_limit:
             raise PreparedContextInvariantError("experience-candidate-limit")
 
+        # Evidence selection owns the plain path only: when the caller also supplied a text
+        # assembly, that explicit section/limit contract keeps rendering the output.
+        if request.evidence_selection and request.assembly is None:
+            fragments = self._evidence_fragments(request, current_scope_id, memory_candidates)
+            if not fragments:
+                return PreparedContextBuild(context=self.empty(), origins=())
+            content = _render_fragments(fragments)
+            return PreparedContextBuild(
+                context=PreparedContext(
+                    status="ready",
+                    content=content,
+                    content_bytes=len(content.encode("utf-8")),
+                ),
+                origins=tuple(fragment.address for fragment in fragments),
+                fragments=fragments,
+            )
+
         content, origins, omissions = self._select_entries(
             request=request,
             current_scope_id=current_scope_id,
@@ -274,8 +321,20 @@ class PreparedContextBuilder:
 
         Pure and side-effect free: no I/O, no persistence, nothing reported to any sink, and
         the same inputs as :meth:`build_scopes_result` are guaranteed to yield the same
-        counters because both go through :meth:`_select_entries`.
+        counters because both run the same selection pass for the same request.
         """
+
+        if request.evidence_selection and request.assembly is None:
+            fragments = self._evidence_fragments(request, current_scope_id, memory_candidates)
+            content = _render_fragments(fragments) if fragments else None
+            content_bytes = 0 if content is None else len(content.encode("utf-8"))
+            return RecallBudgetView(
+                max_bytes=request.max_bytes,
+                delivered_items=len(fragments),
+                truncated_items=0,
+                dropped_items=0,
+                unused_bytes=max(0, request.max_bytes - content_bytes),
+            )
 
         content, origins, omissions = self._select_entries(
             request=request,
@@ -499,6 +558,40 @@ class PreparedContextBuilder:
             )
         return tuple(memory_entries)
 
+    def _evidence_fragments(
+        self,
+        request: PrepareContextRequest,
+        current_scope_id: str | None,
+        memory_candidates: Sequence[PreparedMemoryCandidates],
+    ) -> tuple[PreparedFragment, ...]:
+        """Select literal excerpts of the recalled Memory entries for ``request.query``.
+
+        Evidence selection is defined for the family that carries literal text, so only Memory
+        takes part and Code, TopicMemory and Experience keep their own paths. A candidate group
+        without a Scope identity is skipped, because a citation that cannot name its Scope cannot
+        be checked against the original entry.
+        """
+
+        addresses: list[MemoryEntryAddress] = []
+        texts: list[str] = []
+        for candidates in memory_candidates:
+            scope_id = candidates.scope_id or current_scope_id
+            if not scope_id:
+                continue
+            for entry in self._memory_entries(candidates.memory_ref, candidates.hits, scope_id=scope_id):
+                if not isinstance(entry.origin, MemoryEntryAddress):
+                    continue
+                addresses.append(entry.origin)
+                texts.append(entry.content)
+        if not texts:
+            return ()
+        return _EvidenceSelector(
+            query=request.query,
+            addresses=tuple(addresses),
+            texts=tuple(texts),
+            max_bytes=request.max_bytes,
+        ).run()
+
     def _topic_memory_entries(
         self,
         hits: Sequence[TopicMemorySearchHit],
@@ -658,6 +751,297 @@ class PreparedContextBuilder:
         if best is None:
             return _EntryFit(dropped_no_fitting_truncation=True)
         return _EntryFit(entry=best)
+
+
+def _render_fragments(fragments: Sequence[PreparedFragment]) -> str:
+    envelope = {"trust": "untrusted_history", "items": [_render_fragment(fragment) for fragment in fragments]}
+    encoded = json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
+    return "\n\n".join((TRUST_POLICY, f"{_BEGIN_MARKER}\n{encoded}\n{_END_MARKER}"))
+
+
+def _render_fragment(fragment: PreparedFragment) -> dict[str, object]:
+    """Render one excerpt: the exact citation of its entry version, its text and its range."""
+
+    address = fragment.address
+    return {
+        "citation": {
+            "scope_id": address.memory.scope_id,
+            "memory_ref": address.memory.artifact.model_dump(mode="json"),
+            "entry_id": address.entry_id,
+            "entry_version_id": address.entry_version_id,
+        },
+        "content": fragment.text,
+        "start": fragment.start,
+        "end": fragment.end,
+    }
+
+
+def _fragment_bytes(fragment: PreparedFragment) -> int:
+    return len(json.dumps(_render_fragment(fragment), ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+
+
+# Everything the output costs before the first excerpt: the trust policy, both envelope markers
+# and the JSON shell around the item list. Measured from the renderer itself, never from a literal.
+_EVIDENCE_FIXED_BYTES = len(_render_fragments(()).encode("utf-8"))
+
+
+def _merge_spans(spans: Sequence[tuple[int, int]]) -> tuple[tuple[int, int], ...]:
+    """Join overlapping or nearly touching slices so one citation covers both of them."""
+
+    merged: list[list[int]] = []
+    for start, end in sorted(spans):
+        if merged and start - merged[-1][1] <= _EVIDENCE_MERGE_GAP:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    return tuple((start, end) for start, end in merged)
+
+
+class _EvidenceSelector:
+    """Grow literal excerpts around the sentences that answer one query, inside one budget.
+
+    Rank every literal sentence once, then fill the budget in four passes: whole relevant
+    sentences, relevant cuts, then the same two for whatever is left. Within a pass the leading
+    document is served first and grows towards its neighbours, so the text arrives as long
+    contiguous slices instead of one citation per sentence. Every range is a plain character
+    interval of the original entry: nothing here rewrites, reorders or summarises.
+    """
+
+    def __init__(
+        self,
+        *,
+        query: str,
+        addresses: tuple[MemoryEntryAddress, ...],
+        texts: tuple[str, ...],
+        max_bytes: int,
+    ) -> None:
+        self.addresses = addresses
+        self.texts = texts
+        self.max_bytes = max_bytes
+        self.sentences = rank_evidence(query, texts)
+        # The excerpt, not the entry, carries the fixed citation cost, so a budget this size
+        # buys roughly one document's worth of text. That text is spent on the document whose
+        # sentences answer the query best, because a thinner slice of a worse document still
+        # cannot reconstruct evidence the leader's window already covers.
+        self.leaders = tuple(
+            entry
+            for _, entry in sorted(
+                (-max((sentence.score for sentence in group), default=0.0), entry)
+                for entry, group in enumerate(self.sentences)
+            )
+        )
+        self.spans: dict[int, list[tuple[int, int]]] = {}
+        self.measured: dict[tuple[int, int, int], int] = {}
+
+    def run(self) -> tuple[PreparedFragment, ...]:
+        # Relevant whole sentences first, then relevant cuts, and only after relevance is
+        # exhausted the same two passes for the rest: a cheap irrelevant sentence must never
+        # take bytes that a relevant one could still use, while nothing that does fit is left
+        # over at the end.
+        while self._grow(relevant_only=True) and self._count() < _EVIDENCE_FRAGMENT_LIMIT:
+            pass
+        while self._fill(relevant_only=True) and self._count() < _EVIDENCE_FRAGMENT_LIMIT:
+            pass
+        while self._grow(relevant_only=False) and self._count() < _EVIDENCE_FRAGMENT_LIMIT:
+            pass
+        while self._fill(relevant_only=False) and self._count() < _EVIDENCE_FRAGMENT_LIMIT:
+            pass
+        return self.fragments()
+
+    def fragments(self) -> tuple[PreparedFragment, ...]:
+        """Every selected range, in entry order, as a literal slice of the original text."""
+
+        fragments: list[PreparedFragment] = []
+        for entry in sorted(self.spans):
+            for start, end in _merge_spans(self.spans[entry]):
+                fragments.append(
+                    PreparedFragment(
+                        address=self.addresses[entry],
+                        start=start,
+                        end=end,
+                        text=self.texts[entry][start:end],
+                    )
+                )
+        return tuple(fragments)
+
+    def _grow(self, *, relevant_only: bool) -> bool:
+        """Append one whole sentence of the leading document that still fits."""
+
+        for entry in self.leaders:
+            sentence = self._next_sentence(entry, relevant_only=relevant_only)
+            if sentence is None:
+                continue
+            if self._measure(self._extend(entry, sentence.start, sentence.end)) > self.max_bytes:
+                continue
+            self.spans.setdefault(entry, []).append((sentence.start, sentence.end))
+            return True
+        return False
+
+    def _fill(self, *, relevant_only: bool) -> bool:
+        """Append the longest word-aligned cut of the best remaining sentence that still fits."""
+
+        pending = [
+            sentence
+            for sentence in (
+                self._next_sentence(entry, relevant_only=relevant_only) for entry in range(len(self.sentences))
+            )
+            if sentence
+        ]
+        for sentence in sorted(pending, key=lambda item: (-item.score, item.entry, item.index)):
+            grown = self._cut(sentence)
+            if grown is None:
+                continue
+            self.spans.setdefault(sentence.entry, []).append(grown)
+            return True
+        return False
+
+    def _next_sentence(self, entry: int, *, relevant_only: bool) -> EvidenceSentence | None:
+        """The best sentence of one entry that no slice covers yet.
+
+        A sentence that touches a slice is preferred because it merges into that slice instead of
+        paying a second citation, but only among sentences that are still worth their bytes: when
+        the neighbour says nothing about the query, a relevant sentence elsewhere wins.
+        """
+
+        uncovered = [sentence for sentence in self.sentences[entry] if not self._covered(entry, sentence)]
+        if relevant_only:
+            uncovered = [sentence for sentence in uncovered if sentence.score > 0.0]
+        if not uncovered:
+            return None
+        touching = [sentence for sentence in uncovered if self._touching(entry, sentence)]
+        return max(touching or uncovered, key=lambda sentence: (sentence.score, -sentence.index))
+
+    def _covered(self, entry: int, sentence: EvidenceSentence) -> bool:
+        return any(start <= sentence.start and sentence.end <= end for start, end in self.spans.get(entry, ()))
+
+    def _touching(self, entry: int, sentence: EvidenceSentence) -> bool:
+        for start, end in self.spans.get(entry, ()):
+            if sentence.start - end <= _EVIDENCE_MERGE_GAP and start - sentence.end <= _EVIDENCE_MERGE_GAP:
+                return True
+        return False
+
+    def _reach(self, entry: int, sentence: EvidenceSentence) -> int:
+        """How far the slices of this entry already reach into ``sentence`` from the left."""
+
+        reach = 0
+        for start, end in self.spans.get(entry, ()):
+            if start < sentence.end and end > sentence.start:
+                reach = max(reach, end)
+        return reach
+
+    def _edge(self, entry: int, sentence: EvidenceSentence) -> int:
+        """Where the slices of this entry first touch ``sentence``, seen from the right."""
+
+        edge = sentence.end
+        for start, end in self.spans.get(entry, ()):
+            if start < sentence.end and end > sentence.start:
+                edge = min(edge, start)
+        return edge
+
+    def _cut(self, sentence: EvidenceSentence) -> tuple[int, int] | None:
+        """The longest word-aligned piece of one sentence that still fits the budget.
+
+        Both ends are tried because the budget usually runs out in the middle of a sentence, and
+        which side of it is still free depends on where the neighbouring slices ended up.
+        """
+
+        right = self._cut_right(sentence)
+        left = self._cut_left(sentence)
+        if right is None or left is None:
+            return right if left is None else left
+        return right if right[1] - right[0] >= left[1] - left[0] else left
+
+    def _cut_right(self, sentence: EvidenceSentence) -> tuple[int, int] | None:
+        entry = sentence.entry
+        floor = max(sentence.start + _EVIDENCE_MIN_PARTIAL_CHARS, self._reach(entry, sentence) + 1)
+        if floor >= sentence.end:
+            return None
+        low, high, best = floor, sentence.end, 0
+        while low <= high:
+            middle = (low + high) // 2
+            if self._measure(self._extend(entry, sentence.start, middle)) <= self.max_bytes:
+                best = middle
+                low = middle + 1
+            else:
+                high = middle - 1
+        if not best:
+            return None
+        return (sentence.start, self._snap_forward(entry, best - 1, floor))
+
+    def _cut_left(self, sentence: EvidenceSentence) -> tuple[int, int] | None:
+        entry = sentence.entry
+        ceiling = min(sentence.end, self._edge(entry, sentence)) - _EVIDENCE_MIN_PARTIAL_CHARS
+        if ceiling <= sentence.start:
+            return None
+        low, high, best = sentence.start, ceiling, 0
+        while low <= high:
+            middle = (low + high) // 2
+            if self._measure(self._extend(entry, middle, sentence.end)) <= self.max_bytes:
+                best = middle
+                high = middle - 1
+            else:
+                low = middle + 1
+        if not best:
+            return None
+        return (self._snap_back(entry, best, ceiling), sentence.end)
+
+    def _snap_forward(self, entry: int, end: int, floor: int) -> int:
+        """Move a right edge back to the enclosing word boundary, never below ``floor``."""
+
+        text = self.texts[entry]
+        for index in range(end, floor - 1, -1):
+            if text[index].isspace():
+                return index
+        return end + 1
+
+    def _snap_back(self, entry: int, start: int, ceiling: int) -> int:
+        """Move a left edge forward to the enclosing word boundary, never above ``ceiling``."""
+
+        text = self.texts[entry]
+        for index in range(start, ceiling + 1):
+            if text[index].isspace():
+                return index + 1
+        return start
+
+    def _extend(self, entry: int, start: int, end: int) -> dict[int, list[tuple[int, int]]]:
+        trial = dict(self.spans)
+        trial[entry] = [*trial.get(entry, ()), (start, end)]
+        return trial
+
+    def _count(self) -> int:
+        return sum(len(_merge_spans(spans)) for spans in self.spans.values())
+
+    def _measure(self, spans: dict[int, list[tuple[int, int]]]) -> int:
+        """Exact bytes of the rendering these spans would produce, not of the excerpts alone.
+
+        The trust policy, the envelope markers, the JSON around the items and the commas between
+        them all spend the caller's budget, so each item is measured with the same ``json.dumps``
+        call the final render uses and the fixed part is measured once at import time.
+        """
+
+        total = 0
+        count = 0
+        for entry in sorted(spans):
+            for start, end in _merge_spans(spans[entry]):
+                total += self._item_bytes(entry, start, end)
+                count += 1
+        if not count:
+            return _EVIDENCE_FIXED_BYTES
+        return _EVIDENCE_FIXED_BYTES + total + count - 1
+
+    def _item_bytes(self, entry: int, start: int, end: int) -> int:
+        key = (entry, start, end)
+        cached = self.measured.get(key)
+        if cached is None:
+            excerpt = PreparedFragment(
+                address=self.addresses[entry],
+                start=start,
+                end=end,
+                text=self.texts[entry][start:end],
+            )
+            cached = _fragment_bytes(excerpt)
+            self.measured[key] = cached
+        return cached
 
 
 def _interleave(
