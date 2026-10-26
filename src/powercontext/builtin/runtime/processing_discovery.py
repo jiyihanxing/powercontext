@@ -46,12 +46,25 @@ async def enabled_profile_scopes(connection: AsyncConnection, scope_ids: tuple[s
 
 
 class SourceProcessingPendingProvider:
-    """Inspect journal metadata, never Source bodies, prompts, or models."""
+    """Inspect journal metadata, never Source bodies, prompts, or models.
 
-    def __init__(self, database: AsyncDatabase, binding_name: str, artifact_family: str) -> None:
+    This sweep is also the admission point for count-triggered processing: it
+    compares each Scope's persisted journal head with that Family's committed
+    Source cursor, so replayed identities, receipt upgrades, and consumed
+    history never move the count.
+    """
+
+    def __init__(
+        self,
+        database: AsyncDatabase,
+        binding_name: str,
+        artifact_family: str,
+        source_count_threshold: int | None = None,
+    ) -> None:
         self._database = database
         self._binding = binding_name
         self._family = artifact_family
+        self._count_threshold = source_count_threshold
 
     async def reconcile(self, after_scope_id: str | None, limit: int, *, fence: ArtifactProcessingFence) -> str | None:
         heads = SOURCE_JOURNAL_HEADS_TABLE
@@ -68,9 +81,19 @@ class SourceProcessingPendingProvider:
             cursors = SourceCursorRepository()
             for scope, high in rows:
                 cursor = await cursors.load(connection, scope, self._binding)
-                if int(high) <= (0 if cursor is None else cursor.cursor.sequence):
+                position = 0 if cursor is None else cursor.cursor.sequence
+                if int(high) <= position:
+                    continue
+                # A count threshold admits only the Scope whose whole pending
+                # window reaches it. Below that, the identities stay pending:
+                # they are already durable and are counted again later.
+                if self._count_threshold is not None and int(high) - position < self._count_threshold:
                     continue
                 intent = await intents.load(connection, scope, self._binding, for_update=True)
                 if intent is None or intent.dirty_generation == intent.clean_generation:
-                    await intents.mark_dirty(connection, scope, self._binding)
+                    intent = await intents.mark_dirty(connection, scope, self._binding)
+                if self._count_threshold is not None and intent.requested_generation == intent.handled_generation:
+                    # Accept the invocation here so a restart replays it from the
+                    # durable request instead of re-deriving it from journal state.
+                    await intents.request(connection, scope, self._binding)
         return str(rows[-1][0]) if len(rows) == limit else None

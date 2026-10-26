@@ -472,6 +472,14 @@ class ScopedSourceApplication:
         return await self._capture(value)
 
     async def _capture(self, value: CaptureSource, /, *, handoff_receipt: bool = False) -> SourceReceipt:
+        receipt = await self._commit_capture(value, handoff_receipt=handoff_receipt)
+        # A new journal identity may have crossed this Scope's count threshold.
+        # Publish the re-check only after the capture transaction committed, so
+        # the Supervisor never reads an uncommitted head.
+        self._runtime._wake_source_count_triggers()
+        return receipt
+
+    async def _commit_capture(self, value: CaptureSource, /, *, handoff_receipt: bool = False) -> SourceReceipt:
         if self._runtime._record_service is not None:
             try:
                 async with self._runtime._scope_operation(self.scope_id), self._runtime._locked(self.scope_id):
@@ -563,7 +571,10 @@ class ScopedRecordApplication:
         /,
     ) -> ArtifactCreated:
         async with self._runtime._scope_operation(self.scope_id), self._runtime._locked(self.scope_id):
-            return await self._runtime._records().create_artifact(self.scope_id, family, write)
+            created = await self._runtime._records().create_artifact(self.scope_id, family, write)
+        # The lineage-only Source it published occupies one journal identity.
+        self._runtime._wake_source_count_triggers()
+        return created
 
     async def get_artifact(self, family: str, artifact_id: str, /) -> ArtifactRecord:
         async with self._runtime._scope_operation(self.scope_id):
@@ -3432,6 +3443,14 @@ class BuiltinRuntime:
         if self._record_service is None:
             raise _RuntimeStateError("records")
         return self._record_service
+
+    def _wake_source_count_triggers(self) -> None:
+        """Re-decide count admission after a committed Source journal write."""
+
+        supervisor = self.artifact_processing_supervisor
+        if supervisor is None or not supervisor.source_count_triggered:
+            return
+        supervisor.wake_source_count_triggers()
 
     def _generation(self, scope_id: str) -> ReviewedGenerationService:
         if self._generation_service is None:

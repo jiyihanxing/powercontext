@@ -117,6 +117,9 @@ class ArtifactProcessingBinding:
     # Only automatic admission is filtered; already accepted requests retain
     # their own Worker authorization and domain completion semantics.
     automatic_scope_filter: Callable[[AsyncConnection, tuple[str, ...]], Awaitable[frozenset[str]]] | None = None
+    # Pending journal identities that start one call. `None` keeps the original
+    # time-only admission; a reached count admits without a flush or a deadline.
+    source_count_threshold: int | None = None
 
     def __post_init__(self) -> None:
         if not self.binding_name or self.binding_name != self.binding_name.strip():
@@ -138,6 +141,12 @@ class ArtifactProcessingBinding:
                 raise ValueError("interval and cron cannot both be enabled")  # noqa: TRY003
         if self.cron is not None:
             CronTrigger.from_crontab(self.cron, timezone=ZoneInfo(self.timezone))
+        self._validate_source_count_threshold()
+
+    def _validate_source_count_threshold(self) -> None:
+        threshold = self.source_count_threshold
+        if threshold is not None and (type(threshold) is not int or threshold < 1):
+            raise ValueError("source_count_threshold must be a positive integer")  # noqa: TRY003
 
 
 class _WorkerResultSender(Protocol):
@@ -514,7 +523,26 @@ class ArtifactProcessingSupervisor:
         for name, state in self._families.items():
             if binding_name is None or binding_name == name:
                 state.discovery_pending = True
+                if state.binding.source_count_threshold is not None:
+                    # A count verdict depends on the current journal head and the
+                    # committed cursor, so a new identity or a finished window
+                    # re-opens the sweep instead of reusing the previous verdict.
+                    state.reconcile_complete = False
+                    state.reconcile_after = None
         self._wake.set()
+
+    @property
+    def source_count_triggered(self) -> bool:
+        """Report whether any owned Family admits on a pending Source count."""
+
+        return any(state.binding.source_count_threshold is not None for state in self._families.values())
+
+    def wake_source_count_triggers(self) -> None:
+        """Re-decide count admission after the caller's journal write committed."""
+
+        for name, state in self._families.items():
+            if state.binding.source_count_threshold is not None:
+                self.wake(name)
 
     async def close(self) -> None:
         self._stop.set()
@@ -644,6 +672,10 @@ class ArtifactProcessingSupervisor:
                 state.reconcile_after, _DISCOVERY_PAGE_SIZE, fence=self._require_current_fence()
             )
             state.reconcile_complete = state.reconcile_after is None
+            if binding.source_count_threshold is not None:
+                # This page may have accepted count-triggered work, so the
+                # requested channel has to observe it within the same pass.
+                state.discovery_pending = True
             if not state.reconcile_complete:
                 state.next_discovery_at = loop.time() + _DISCOVERY_PAGE_DELAY_SECONDS
         else:
@@ -1188,9 +1220,17 @@ class ArtifactProcessingSupervisors:
     def family_status(self) -> dict[str, dict[str, int | float | str]]:
         return {family: status for item in self.supervisors for family, status in item.family_status.items()}
 
+    @property
+    def source_count_triggered(self) -> bool:
+        return any(item.source_count_triggered for item in self.supervisors)
+
     def wake(self, binding_name: str | None = None) -> None:
         for supervisor in self.supervisors:
             supervisor.wake(binding_name)
+
+    def wake_source_count_triggers(self) -> None:
+        for supervisor in self.supervisors:
+            supervisor.wake_source_count_triggers()
 
     async def close(self) -> None:
         await asyncio.gather(*(item.close() for item in self.supervisors))
