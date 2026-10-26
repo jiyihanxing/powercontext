@@ -40,6 +40,11 @@ their agreed wording back as extra terms. Layout priors then apply the way a
 finance report actually reads: a quantified question is answered on a primary
 statement page, and statements and notes sit next to each other, so the
 neighbours of a strong page are themselves plausible evidence.
+
+The lexical index of the captured pages is derived from the pages alone, never
+from the question, so it is cached for the life of the process: one collection
+pays for its tokenisation once and every later question only rebinds the current
+citations and the current full-text priors onto the cached index.
 """
 
 from __future__ import annotations
@@ -48,7 +53,9 @@ import hashlib
 import io
 import math
 import re
-from dataclasses import dataclass
+import threading
+from collections import OrderedDict
+from dataclasses import dataclass, replace
 from itertools import pairwise
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
@@ -76,8 +83,15 @@ PDF_PAGE_DEFAULT_SEARCH_LIMIT = 10
 # environment locks pypdf only, so ranking must not need any other library.
 _TOKEN_PATTERN = re.compile(r"[a-z]+|\d+")
 _PAGE_MARKER = "#p"
-_EOF_MARKER = re.compile(rb"%%EOF")
+_EOF_MARKER = b"%%EOF"
 _EOF_WINDOW = 8192
+# A conforming writer ends the file with the marker, optionally followed by
+# whitespace or the zero padding some tools append, and nothing else.
+_INERT_BYTES = b"\x00\t\n\f\r "
+_XREF_REFERENCE = re.compile(rb"startxref\s+(\d+)")
+_XREF_SECTION_HEAD = re.compile(rb"xref\b|\d+\s+\d+\s*obj\b")
+_TRUNCATED_MESSAGE = "PDF document is truncated and cannot be parsed completely"
+_PAGE_SHORTFALL_MESSAGE = "PDF document declares {declared} pages but only {readable} can be read"
 _PREFIX_LENGTH = 6
 _PREFIX_WEIGHT = 0.75
 _PAIR_SHIFT = 20
@@ -99,6 +113,10 @@ _NEIGHBOUR_DECAY = {1: 0.6, 2: 0.4}
 _MAX_SEARCH_LIMIT = 1_000
 _FTS_CANDIDATES = 50
 _FTS_PRIOR_WEIGHT = 0.3
+# Page indexes kept for reuse. One 503-page report costs about 15 MB of index, so
+# the bound is small: a scope is searched through one revision set at a time, and
+# a second slot covers an ingest landing between two questions.
+_PAGE_INDEX_CACHE_SIZE = 2
 
 _STOPWORD_TEXT = """
     a about above after again against all also am an and any are as at be because been before being below between both
@@ -120,9 +138,12 @@ _NUMERIC_TEXT = """
 
 _NUMERIC_INTENT = frozenset(_NUMERIC_TEXT.split())
 
-# Generic finance-report vocabulary. Keys are six-character term prefixes, so a
-# question word and the report's own wording meet without a document-specific
-# dictionary: nothing here names a company, a document or an answer.
+# Generic finance-report vocabulary. A key is a lowercase term prefix that a
+# question token reaches through ``str.startswith``, so a question word and the
+# report's own wording meet without a document-specific dictionary: nothing here
+# names a company, a document or an answer. Matching on a fixed-width slice of
+# the token instead would silently make every key shorter than that width
+# unreachable, which is a dead rule nobody notices.
 _EXPANSIONS: dict[str, tuple[str, ...]] = {
     "geogra": ("geographic", "region", "country", "international", "division", "segment"),
     "region": ("geographic", "country"),
@@ -145,6 +166,10 @@ _EXPANSIONS: dict[str, tuple[str, ...]] = {
     "govern": ("director", "executive", "board", "committee"),
     "risk": ("risk", "uncertainty", "exposure"),
 }
+
+# Longest key first, so the most specific vocabulary wins when several prefixes
+# of one token are keys and the answer never depends on table order.
+_EXPANSION_KEYS: tuple[str, ...] = tuple(sorted(_EXPANSIONS, key=lambda key: (-len(key), key)))
 
 
 class PDFDocumentInput(BaseModel):
@@ -325,19 +350,54 @@ def _extract_page_texts(raw: bytes) -> tuple[str, ...]:
         raise ValueError(f"PDF document cannot be parsed: {error}") from error
     if count < 1:
         raise ValueError("PDF document declares no physical page")
+    declared = _declared_page_count(reader)
+    if declared is not None and count < declared:
+        raise ValueError(_PAGE_SHORTFALL_MESSAGE.format(declared=declared, readable=count))
     return tuple(_read_page_text(pages, index) for index in range(count))
 
 
 def _require_complete_file(raw: bytes) -> None:
     """Reject a file whose end is gone: a truncated report has no last page.
 
-    Every conforming PDF terminates with the end-of-file marker. When the bytes
-    are cut short, a reader may still recover a prefix of the pages; that
-    prefix is exactly the partial report this contract must never return.
+    Every conforming PDF terminates with its end-of-file marker, and the last
+    cross-reference section of the file announces its own offset just before that
+    marker. A file cut short still carries the marker of its previous revision, so
+    finding *a* marker proves nothing: a revision appended and then truncated
+    leaves its own bytes after the last marker, and the surviving marker of the
+    older revision would otherwise let a reader recover a prefix of the pages,
+    which is exactly the partial report this contract must never return. The final
+    marker must therefore be the end of the file, and it must close the
+    cross-reference section the file's own trailer announces; the number of pages
+    the document declares is then checked against the pages actually readable.
     """
 
-    if not _EOF_MARKER.search(raw[-_EOF_WINDOW:]):
-        raise ValueError("PDF document is truncated and cannot be parsed completely")
+    end = raw.rfind(_EOF_MARKER)
+    if end < 0:
+        raise ValueError(_TRUNCATED_MESSAGE)
+    if raw[end + len(_EOF_MARKER) :].strip(_INERT_BYTES):
+        raise ValueError(_TRUNCATED_MESSAGE)
+    trailers = tuple(_XREF_REFERENCE.finditer(raw, max(0, end - _EOF_WINDOW), end))
+    if not trailers:
+        raise ValueError(_TRUNCATED_MESSAGE)
+    trailer = trailers[-1]
+    if raw[trailer.end() : end].strip(_INERT_BYTES):
+        raise ValueError(_TRUNCATED_MESSAGE)
+    if not _starts_cross_reference(raw, int(trailer.group(1))):
+        raise ValueError(_TRUNCATED_MESSAGE)
+
+
+def _starts_cross_reference(raw: bytes, offset: int) -> bool:
+    """Tell whether ``offset`` really begins a cross-reference section.
+
+    A cross-reference section is either the classic ``xref`` table or the object
+    that carries a cross-reference stream, so the announced offset has to land on
+    one of those two heads and inside the file.
+    """
+
+    if offset <= 0 or offset >= len(raw):
+        return False
+    head = raw[offset : offset + 64].lstrip(_INERT_BYTES)
+    return _XREF_SECTION_HEAD.match(head) is not None
 
 
 def _open_pdf_reader(raw: bytes) -> Any:
@@ -357,6 +417,25 @@ def _open_pdf_reader(raw: bytes) -> Any:
         if not unlocked:
             raise ValueError("PDF document cannot be read without a password")
     return reader
+
+
+def _declared_page_count(reader: Any) -> int | None:
+    """Read how many pages the document's own page tree promises, if it says."""
+
+    try:
+        count = _resolved(_resolved(reader.trailer["/Root"])["/Pages"])["/Count"]
+    except Exception:
+        return None
+    count = _resolved(count)
+    if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+        return None
+    return count
+
+
+def _resolved(value: Any) -> Any:
+    """Dereference an indirect object; a direct one already is the value."""
+
+    return value.get_object() if hasattr(value, "get_object") else value
 
 
 def _read_page_text(pages: Any, index: int) -> str:
@@ -481,10 +560,69 @@ def _rank_pages(question: str, entries: tuple[_PageEntry, ...], prior: dict[str,
     return tuple(index.entry for index in _spread_neighbours(scored))
 
 
+# Tokenising a whole collection costs more than ranking it, and the tokens of a
+# page never depend on the question, so the index of an unchanged set of captured
+# pages is kept and reused by every later question.
+_PAGE_INDEX_CACHE: OrderedDict[
+    tuple[tuple[str, str], ...], tuple[tuple[_PageIndex, ...], dict[str, int]]
+] = OrderedDict()
+_PAGE_INDEX_CACHE_LOCK = threading.Lock()
+_PAGE_INDEX_CACHE_HITS = 0
+_PAGE_INDEX_CACHE_MISSES = 0
+
+
 def _index_pages(
     entries: tuple[_PageEntry, ...],
     prior: dict[str, float],
 ) -> tuple[tuple[_PageIndex, ...], dict[str, int]]:
+    """Index the captured pages, rebinding a cached index to this Memory state.
+
+    Only the question-dependent parts are applied here, the citation of the
+    current Memory entry of each page and the store's own full-text prior, so a
+    second question over the same captured revisions never tokenises again.
+    """
+
+    cached, vocabulary = _cached_page_indexes(entries)
+    current = {entry.key: entry for entry in entries}
+    indexes = tuple(
+        replace(index, entry=current[index.entry.key], prior=prior.get(index.entry.key, 0.0)) for index in cached
+    )
+    return indexes, vocabulary
+
+
+def _cached_page_indexes(
+    entries: tuple[_PageEntry, ...],
+) -> tuple[tuple[_PageIndex, ...], dict[str, int]]:
+    """Return the index of exactly this set of captured page revisions.
+
+    The key is the sorted identity of the pages, and a page identity already
+    carries its document digest and physical page number, so a revised document,
+    an added page or a removed page all miss while re-asking over an unchanged
+    Memory hits. A duplicate build cannot publish a wrong index, because the build
+    happens outside the lock and the cache entry is written whole.
+    """
+
+    global _PAGE_INDEX_CACHE_HITS, _PAGE_INDEX_CACHE_MISSES
+    key = tuple(sorted((entry.key, entry.citation.entry_version_id) for entry in entries))
+    with _PAGE_INDEX_CACHE_LOCK:
+        cached = _PAGE_INDEX_CACHE.get(key)
+        if cached is not None:
+            _PAGE_INDEX_CACHE.move_to_end(key)
+            _PAGE_INDEX_CACHE_HITS += 1
+            return cached
+        _PAGE_INDEX_CACHE_MISSES += 1
+    built = _build_page_indexes(entries)
+    with _PAGE_INDEX_CACHE_LOCK:
+        _PAGE_INDEX_CACHE[key] = built
+        _PAGE_INDEX_CACHE.move_to_end(key)
+        while len(_PAGE_INDEX_CACHE) > _PAGE_INDEX_CACHE_SIZE:
+            _PAGE_INDEX_CACHE.popitem(last=False)
+    return built
+
+
+def _build_page_indexes(entries: tuple[_PageEntry, ...]) -> tuple[tuple[_PageIndex, ...], dict[str, int]]:
+    """Tokenise every captured page once, from the pages alone."""
+
     vocabulary: dict[str, int] = {}
     indexes: list[_PageIndex] = []
     for entry in entries:
@@ -505,10 +643,27 @@ def _index_pages(
                 prefix_freq=prefix_freq,
                 pairs=_pairs(tokens, vocabulary),
                 heading_terms=_statement_heading(body),
-                prior=prior.get(entry.key, 0.0),
+                prior=0.0,
             )
         )
     return tuple(indexes), vocabulary
+
+
+def _clear_page_index_cache() -> None:
+    """Drop the cached page index, so a caller can observe a cold build again."""
+
+    global _PAGE_INDEX_CACHE_HITS, _PAGE_INDEX_CACHE_MISSES
+    with _PAGE_INDEX_CACHE_LOCK:
+        _PAGE_INDEX_CACHE.clear()
+        _PAGE_INDEX_CACHE_HITS = 0
+        _PAGE_INDEX_CACHE_MISSES = 0
+
+
+def _page_index_cache_stats() -> tuple[int, int, int]:
+    """Return ``(hits, misses, cached collections)`` of the page index cache."""
+
+    with _PAGE_INDEX_CACHE_LOCK:
+        return _PAGE_INDEX_CACHE_HITS, _PAGE_INDEX_CACHE_MISSES, len(_PAGE_INDEX_CACHE)
 
 
 def _page_body(text: str) -> str:
@@ -542,6 +697,20 @@ def _statement_heading(body: str) -> frozenset[str]:
     return frozenset()
 
 
+def _expansions_for(token: str) -> tuple[str, ...]:
+    """Return the vocabulary one question token opens, or nothing.
+
+    The longest key that prefixes the token wins, so ``battl`` reaches a report
+    that only ever writes ``battle`` and ``geogra`` still reaches every
+    ``geographic``/``geography`` wording of the same question.
+    """
+
+    for key in _EXPANSION_KEYS:
+        if token.startswith(key):
+            return _EXPANSIONS[key]
+    return ()
+
+
 def _query_terms(question: str) -> tuple[_QueryTerm, ...]:
     """Analyse the question into weighted terms, including finance expansions."""
 
@@ -551,7 +720,7 @@ def _query_terms(question: str) -> tuple[_QueryTerm, ...]:
             continue
         weights[token] = max(weights.get(token, 0.0), _term_weight(token))
     for token in tuple(weights):
-        for extra in _EXPANSIONS.get(token[:_PREFIX_LENGTH], ()):
+        for extra in _expansions_for(token):
             normalized = _normalize(extra)
             if normalized and normalized not in weights:
                 weights[normalized] = _EXPANSION_WEIGHT
