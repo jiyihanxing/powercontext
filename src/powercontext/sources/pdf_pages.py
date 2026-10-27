@@ -450,15 +450,32 @@ def _read_page_text(pages: Any, index: int) -> str:
 
 
 def _extract_page_text(page: Any) -> str | None:
-    """Render one page with the fixed plain-text extraction, layout as fallback."""
+    """Render one page with the plain-text extraction, layout only as a rescue.
 
-    for mode in (None, "layout"):
-        try:
-            rendered = page.extract_text() if mode is None else page.extract_text(extraction_mode=mode)
-        except Exception:
-            rendered = None
-        if isinstance(rendered, str):
-            return rendered.strip()
+    The default mode is authoritative whenever it yields text, so a page that
+    already extracts never changes and the second pass is paid only where it can
+    matter. A page whose default extraction raises or comes back empty is retried
+    with the layout mode: selectable text that only the layout mode exposes
+    (vector glyphs, column order, unusual encodings) would otherwise be lost as a
+    blank page. A page that stays empty in both modes is still blank.
+    """
+
+    try:
+        rendered = page.extract_text()
+    except Exception:
+        rendered = None
+    if isinstance(rendered, str) and rendered.strip():
+        return rendered.strip()
+    try:
+        fallback = page.extract_text(extraction_mode="layout")
+    except Exception:
+        fallback = None
+    if isinstance(fallback, str) and fallback.strip():
+        return fallback.strip()
+    if isinstance(rendered, str):
+        return rendered.strip()
+    if isinstance(fallback, str):
+        return fallback.strip()
     return None
 
 
